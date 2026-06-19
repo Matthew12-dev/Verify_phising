@@ -1,4 +1,4 @@
-# proyecto-monitor — Detector de Phishing
+# Verify_Phing 
 
 Sistema de detección de phishing para Raspberry Pi 5 con Python e IA.  
 Analiza correos electrónicos y URLs sospechosas en 3 capas de verificación para detectar intentos de suplantación de dominios oficiales.
