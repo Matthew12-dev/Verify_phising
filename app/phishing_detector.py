@@ -1,8 +1,16 @@
 """
 Deteccion de phishing en 3 capas:
-  Capa 1 — Whitelist deterministica
+  Capa 1 — Whitelist deterministica (UNICA capa que decide is_phishing)
   Capa 2 — Similitud de dominio (SequenceMatcher + confusables visuales)
   Capa 3 — Analisis de ortografia del mensaje (TextBlob con fallback heuristico)
+
+DISEÑO "default deny": si el remitente/dominio no esta en la lista de
+contactos aprobados, se marca como intento de phishing de forma
+determinista (is_phishing=True). Las capas 2 y 3 NO pueden revertir esa
+decision: su funcion es calcular la SEVERIDAD del ataque (que tan
+sofisticado es el intento de suplantacion) para que el usuario sepa si
+esta ante un dominio aleatorio desconocido o ante una suplantacion
+deliberada y elaborada de la empresa.
 """
 
 import re
@@ -28,14 +36,22 @@ class PhishingDetector:
     """
     Analiza un correo/URL mas el contenido del mensaje para determinar si es phishing.
 
-    Capa 1 (whitelist): coincidencia exacta contra dominios/correos aprobados.
-    Capa 2 (similitud): SequenceMatcher + deteccion de confusables visuales.
-    Capa 3 (ortografia): TextBlob para detectar errores gramaticales, exceso de
-                          mayusculas y densidad de caracteres especiales.
+    Capa 1 (whitelist): UNICA capa que decide is_phishing. Si el remitente
+                         no esta aprobado, se marca como phishing, punto.
+    Capa 2 (similitud):  no decide el veredicto. Aporta severidad: indica
+                         si el dominio desconocido ademas intenta imitar
+                         visualmente a uno legitimo (typosquatting, confusables).
+    Capa 3 (ortografia): no decide el veredicto. Aporta severidad: indica
+                         si el mensaje tiene patrones de redaccion tipicos
+                         de phishing (errores, mayusculas, simbolos).
     """
 
-    _SIM_SUSPICIOUS = 0.80   # similitud >= este valor → sospechoso
-    _SIM_PHISHING   = 0.92   # similitud >= este valor → phishing probable
+    _SIM_SUSPICIOUS = 0.80   # similitud >= este valor → aporta severidad media
+    _SIM_PHISHING   = 0.92   # similitud >= este valor → aporta severidad alta
+
+    # Severidad base por no estar en whitelist (un correo desconocido,
+    # SIN ninguna otra señal, ya es phishing — pero de severidad baja)
+    _BASE_RISK_NOT_WHITELISTED = 0.40
 
     def __init__(
         self,
@@ -52,8 +68,9 @@ class PhishingDetector:
     def analyze(self, email_or_url: str, message_content: str = "") -> dict:
         """
         Retorna un dict con:
-          is_phishing    (bool)
-          risk_score     (float 0.0–1.0)
+          is_phishing    (bool)  — determinado SOLO por la capa 1 (whitelist)
+          risk_score     (float 0.0–1.0) — severidad, calculada con las 3 capas
+          severity       (str) — "NINGUNA" | "BAJA" | "MEDIA" | "ALTA"
           reason         (str)
           layers_analyzed (dict con el detalle de cada capa)
         """
@@ -64,12 +81,15 @@ class PhishingDetector:
         layer2 = self._check_similarity(host)
         layer3 = self._check_message_spelling(message_content)
 
-        risk_score         = self._compute_risk(layer1, layer2, layer3)
-        is_phishing, reason = self._decide(layer1, layer2, layer3, risk_score)
+        risk_score = self._compute_risk(layer1, layer2, layer3)
+        is_phishing = not layer1["passed"]          # <-- determinista, solo capa 1
+        severity    = self._severity_label(layer1, risk_score)
+        reason      = self._build_reason(layer1, layer2, layer3, risk_score)
 
         return {
             "is_phishing": is_phishing,
             "risk_score":  round(risk_score, 3),
+            "severity":    severity,
             "reason":      reason,
             "layers_analyzed": {
                 "layer1_whitelist":  layer1,
@@ -79,13 +99,17 @@ class PhishingDetector:
         }
 
     # ------------------------------------------------------------------
-    # Capa 1 — Whitelist deterministica
+    # Capa 1 — Whitelist deterministica (DECIDE is_phishing)
     # ------------------------------------------------------------------
 
     def _check_whitelist(self, target: str, host: str) -> dict:
         """
         Coincidencia exacta contra dominios y correos aprobados.
         Los subdominios de dominios aprobados tambien se aceptan (ej: mail.empresa.com).
+
+        Esta es la UNICA capa que determina is_phishing. Si "passed" es
+        False, el remitente se trata como no autorizado / phishing,
+        sin importar lo que digan las capas 2 y 3.
         """
         in_domains = host in self._domains or any(
             host.endswith("." + d) for d in self._domains
@@ -99,13 +123,16 @@ class PhishingDetector:
         }
 
     # ------------------------------------------------------------------
-    # Capa 2 — Similitud de dominio
+    # Capa 2 — Similitud de dominio (solo aporta severidad, no decide)
     # ------------------------------------------------------------------
 
     def _check_similarity(self, host: str) -> dict:
         """
         SequenceMatcher compara el host contra cada dominio legitimo.
-        Un score alto en un dominio que NO esta en la whitelist es sospechoso.
+        Un score alto en un dominio que NO esta en la whitelist indica
+        que el atacante intenta imitar visualmente a la empresa
+        (typosquatting). Esto SUMA severidad, pero el veredicto ya
+        quedo fijado por la capa 1.
         """
         best_match = ""
         best_score = 0.0
@@ -148,7 +175,7 @@ class PhishingDetector:
         }
 
     # ------------------------------------------------------------------
-    # Capa 3 — Ortografia y estilo del mensaje
+    # Capa 3 — Ortografia y estilo del mensaje (solo aporta severidad)
     # ------------------------------------------------------------------
 
     def _check_message_spelling(self, message: str) -> dict:
@@ -159,6 +186,7 @@ class PhishingDetector:
           special_ratio — densidad de caracteres especiales (!$%#...)
 
         Si TextBlob no esta instalado, solo se calculan las dos heuristicas.
+        Esta capa NUNCA decide is_phishing; solo suma severidad.
         """
         if not message:
             return {"analyzed": False, "reason": "Mensaje vacio", "suspicious": False}
@@ -199,46 +227,80 @@ class PhishingDetector:
         }
 
     # ------------------------------------------------------------------
-    # Calculo de riesgo y decision final
+    # Calculo de severidad (risk_score) — NO decide is_phishing
     # ------------------------------------------------------------------
 
     def _compute_risk(self, l1: dict, l2: dict, l3: dict) -> float:
+        """
+        Si l1 paso (whitelist), no hay riesgo: 0.0.
+
+        Si l1 NO paso, el remitente YA es phishing por definicion. Este
+        metodo calcula que tan severo/sofisticado es el intento, sumando
+        señales de las capas 2 y 3 sobre una base minima por no estar
+        autorizado.
+        """
         if l1["passed"]:
             return 0.0
 
-        score = 0.0
+        # Base: el solo hecho de no estar en whitelist ya es sospechoso
+        score = self._BASE_RISK_NOT_WHITELISTED
         sim   = l2["similarity_score"]
 
         if sim >= self._SIM_PHISHING:
-            score += 0.55
-        elif sim >= self._SIM_SUSPICIOUS:
             score += 0.35
-
-        if l2["confusables"]["found"]:
-            score += 0.25
-
-        if l3.get("suspicious"):
+        elif sim >= self._SIM_SUSPICIOUS:
             score += 0.20
 
-        if l3.get("error_ratio", 0) > 0.25:
+        if l2["confusables"]["found"]:
+            score += 0.15
+
+        if l3.get("suspicious"):
             score += 0.10
+
+        if l3.get("error_ratio", 0) > 0.25:
+            score += 0.05
 
         return min(score, 1.0)
 
-    def _decide(self, l1: dict, l2: dict, l3: dict, risk: float) -> tuple:
+    def _severity_label(self, l1: dict, risk: float) -> str:
+        """Traduce el risk_score a una etiqueta legible para el panel."""
         if l1["passed"]:
-            return False, "En lista blanca"
+            return "NINGUNA"
+        if risk >= 0.85:
+            return "ALTA"
+        if risk >= 0.60:
+            return "MEDIA"
+        return "BAJA"
 
-        if risk >= 0.70:
-            return True,  "Phishing probable: dominio muy similar al legitimo"
-        if l2["confusables"]["found"] and risk >= 0.40:
-            return True,  "Phishing probable: caracteres confusables detectados"
-        if risk >= 0.35:
-            return False, "Sospechoso: similitud alta con dominio legitimo"
-        if l3.get("suspicious") and risk >= 0.20:
-            return False, "Sospechoso: contenido del mensaje con indicadores de phishing"
+    def _build_reason(self, l1: dict, l2: dict, l3: dict, risk: float) -> str:
+        """
+        Construye una razon legible. Si l1 paso, es legitimo. Si no,
+        SIEMPRE es phishing (capa 1 lo decide), y aqui se describe
+        CON QUE TIPO de ataque coincide segun las capas 2 y 3.
+        """
+        if l1["passed"]:
+            return "En lista blanca: remitente aprobado por la organizacion"
 
-        return False, "Sin indicadores de phishing"
+        details = ["Remitente no esta en la lista de contactos aprobados"]
+
+        sim = l2["similarity_score"]
+        if l2["confusables"]["found"]:
+            details.append(
+                f"caracteres confusables detectados imitando '{l2['best_match']}'"
+            )
+        elif sim >= self._SIM_PHISHING:
+            details.append(
+                f"dominio {sim:.0%} similar a '{l2['best_match']}' (suplantacion probable)"
+            )
+        elif sim >= self._SIM_SUSPICIOUS:
+            details.append(
+                f"dominio con similitud sospechosa ({sim:.0%}) a '{l2['best_match']}'"
+            )
+
+        if l3.get("suspicious"):
+            details.append("mensaje con indicadores de redaccion de phishing")
+
+        return "Phishing (no autorizado): " + "; ".join(details)
 
     # ------------------------------------------------------------------
     # Utilidades estaticas
