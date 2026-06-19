@@ -46,7 +46,7 @@ TextBlob con modelos de corrección ortográfica pre-entrenados. No requiere ent
 
 ```bash
 # En la Raspberry Pi
-cd proyecto-monitor
+cd Verify_phising
 
 # Crear entorno virtual
 python3 -m venv venv
@@ -65,7 +65,8 @@ python3 -c "import textblob; textblob.download_corpora()"
 >
 > ```bash
 > pip install Flask Flask-CORS textblob python-dotenv
-> python3 -c "import textblob; textblob.download_corpora()"
+> python3 -m textblob.download_corpora
+> python3 -c "import nltk; nltk.download('punkt_tab')"
 > ```
 
 ---
