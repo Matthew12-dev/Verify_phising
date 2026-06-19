@@ -10,9 +10,6 @@ from database.logger_db import DatabaseLogger
 from app.decision_engine import DecisionEngine
 from app.phishing_detector import PhishingDetector
 
-# ---------------------------------------------------------------------------
-# Instancias globales
-# ---------------------------------------------------------------------------
 
 config = ConfigManager()
 db     = DatabaseLogger()
@@ -37,29 +34,41 @@ CORS(app)
 
 # ---------------------------------------------------------------------------
 # Generador de resumen amigable para el usuario
+#
+# IMPORTANTE: el veredicto (LEGÍTIMO vs PHISHING) viene DIRECTO de
+# result["is_phishing"], que a su vez depende exclusivamente de la
+# Capa 1 (whitelist) dentro de phishing_detector.py. Las capas 2 y 3
+# NUNCA cambian si algo es phishing o no — solo aportan la severidad
+# ("severity": BAJA/MEDIA/ALTA) que gradúa QUÉ TAN peligroso es el
+# intento. Este archivo solo traduce esos datos a texto/color para
+# el panel; no debe re-derivar el veredicto a partir de risk_score.
 # ---------------------------------------------------------------------------
 
 def _build_user_summary(result: dict) -> dict:
-    risk     = result["risk_score"]
-    risk_pct = round(risk * 100)
+    risk        = result["risk_score"]
+    risk_pct    = round(risk * 100)
+    is_phishing = result["is_phishing"]
+    severity    = result.get("severity", "BAJA" if is_phishing else "NINGUNA")
 
     layers = result.get("layers_analyzed", {})
     l1 = layers.get("layer1_whitelist",  {})
     l2 = layers.get("layer2_similarity", {})
     l3 = layers.get("layer3_spelling",   {})
 
-    if risk > 0.80:
-        verdict       = "PHISHING_PROBABLE"
-        verdict_label = "🚫 PHISHING PROBABLE - ALTO RIESGO"
-    elif risk >= 0.60:
-        verdict       = "SUSPICIOUS"
-        verdict_label = "⚠️ SOSPECHOSO - RIESGO MEDIO"
-    elif risk >= 0.40:
-        verdict       = "REVIEW_MANUALLY"
-        verdict_label = "⚡ REVISAR MANUALMENTE - RIESGO BAJO"
-    else:
+    # El veredicto sale de is_phishing (Capa 1). La severidad solo
+    # elige QUÉ TAN fuerte se muestra la alerta de phishing.
+    if not is_phishing:
         verdict       = "LIKELY_LEGITIMATE"
         verdict_label = "✅ PROBABLEMENTE LEGÍTIMO"
+    elif severity == "ALTA":
+        verdict       = "PHISHING_HIGH"
+        verdict_label = "🚫 PHISHING — SUPLANTACIÓN PROBABLE (RIESGO ALTO)"
+    elif severity == "MEDIA":
+        verdict       = "PHISHING_MEDIUM"
+        verdict_label = "🚫 PHISHING — INDICIOS DE SUPLANTACIÓN (RIESGO MEDIO)"
+    else:
+        verdict       = "PHISHING_LOW"
+        verdict_label = "🚫 PHISHING — REMITENTE NO AUTORIZADO (RIESGO BAJO)"
 
     main_reasons: list[str] = []
 
@@ -69,6 +78,11 @@ def _build_user_summary(result: dict) -> dict:
         elif l1.get("matched_domain"):
             main_reasons.append("Dominio en lista blanca de dominios aprobados")
     else:
+        # Esta primera razón siempre aplica: es la que decide el veredicto.
+        main_reasons.append(
+            "Remitente no está en la lista de contactos aprobados de la organización"
+        )
+
         sim  = l2.get("similarity_score", 0)
         best = l2.get("best_match", "")
         if sim >= 0.80 and best:
@@ -119,18 +133,25 @@ def _build_user_summary(result: dict) -> dict:
             rec = "Este correo es de un contacto aprobado y no muestra signos de phishing. Puedes confiar en él."
         else:
             rec = "No se detectaron indicadores de phishing. Aún así, mantén precaución con enlaces y archivos adjuntos desconocidos."
-    elif verdict == "REVIEW_MANUALLY":
-        rec = "Este mensaje tiene algunas características inusuales. Verifica la identidad del remitente antes de hacer clic en enlaces o proporcionar datos personales."
-    elif verdict == "SUSPICIOUS":
-        rec = "Este mensaje presenta signos sospechosos típicos de phishing. No hagas clic en enlaces ni proporciones datos sin verificar la fuente directamente."
-    else:
-        rec = ("Este mensaje muestra múltiples signos de intento de phishing. "
+    elif verdict == "PHISHING_LOW":
+        rec = ("El remitente NO está autorizado por la organización. No se detectaron señales "
+               "adicionales de suplantación (dominio distinto, sin similitud sospechosa), pero "
+               "por política, cualquier remitente fuera de la lista aprobada debe tratarse con "
+               "precaución. Verifica su identidad por otro canal antes de responder.")
+    elif verdict == "PHISHING_MEDIUM":
+        rec = ("El remitente no está autorizado y además presenta señales de posible suplantación "
+               "(similitud con un dominio legítimo y/o redacción sospechosa). No hagas clic en "
+               "enlaces ni compartas datos sin verificar la fuente por otro canal.")
+    else:  # PHISHING_HIGH
+        rec = ("Este mensaje muestra múltiples signos de un intento de phishing dirigido: dominio "
+               "que imita al de la empresa y/o mensaje con redacción sospechosa. "
                "NO hagas clic en enlaces, NO proporciones contraseñas ni datos personales. "
                "Contacta a tu equipo de TI de inmediato.")
 
     return {
         "verdict":            verdict,
         "verdict_label":      verdict_label,
+        "severity":           severity,
         "risk_percentage":    risk_pct,
         "main_reasons":       main_reasons,
         "spelling_assessment": spelling_assessment,
@@ -236,9 +257,9 @@ PANEL_HTML = """
       background: #1e293b;
     }
     .verdict-likely-legitimate  { border-left-color: #22c55e; background: #052e16cc; }
-    .verdict-review-manually    { border-left-color: #a3a3a3; background: #1c191799; }
-    .verdict-suspicious         { border-left-color: #f59e0b; background: #431407cc; }
-    .verdict-phishing-probable  { border-left-color: #ef4444; background: #450a0acc; }
+    .verdict-phishing-low       { border-left-color: #f59e0b; background: #431407cc; }
+    .verdict-phishing-medium    { border-left-color: #f97316; background: #4a1d0bcc; }
+    .verdict-phishing-high      { border-left-color: #ef4444; background: #450a0acc; }
 
     .verdict-label {
       font-size: 1.4rem;
@@ -247,16 +268,16 @@ PANEL_HTML = """
       line-height: 1.3;
     }
     .verdict-likely-legitimate  .verdict-label { color: #86efac; }
-    .verdict-review-manually    .verdict-label { color: #d4d4d4; }
-    .verdict-suspicious         .verdict-label { color: #fcd34d; }
-    .verdict-phishing-probable  .verdict-label { color: #fca5a5; }
+    .verdict-phishing-low       .verdict-label { color: #fcd34d; }
+    .verdict-phishing-medium    .verdict-label { color: #fdba74; }
+    .verdict-phishing-high      .verdict-label { color: #fca5a5; }
 
     .risk-meta { display: flex; justify-content: space-between; font-size: 0.82rem; color: #94a3b8; margin-bottom: 6px; }
     .risk-bar-track { height: 10px; background: #0f172a; border-radius: 99px; overflow: hidden; }
     .risk-bar-fill  { height: 100%; border-radius: 99px; transition: width .6s ease; background: #22c55e; }
-    .verdict-review-manually   .risk-bar-fill { background: #a3a3a3; }
-    .verdict-suspicious        .risk-bar-fill { background: #f59e0b; }
-    .verdict-phishing-probable .risk-bar-fill { background: #ef4444; }
+    .verdict-phishing-low    .risk-bar-fill { background: #f59e0b; }
+    .verdict-phishing-medium .risk-bar-fill { background: #f97316; }
+    .verdict-phishing-high   .risk-bar-fill { background: #ef4444; }
 
     /* ── section title ── */
     .section-title {
@@ -338,16 +359,16 @@ PANEL_HTML = """
       border-left: 4px solid #64748b;
     }
     .rec-likely-legitimate  { border-left-color: #22c55e; background: #052e1699; }
-    .rec-review-manually    { border-left-color: #a3a3a3; }
-    .rec-suspicious         { border-left-color: #f59e0b; background: #43140799; }
-    .rec-phishing-probable  { border-left-color: #ef4444; background: #450a0a99; }
+    .rec-phishing-low       { border-left-color: #f59e0b; background: #43140799; }
+    .rec-phishing-medium    { border-left-color: #f97316; background: #4a1d0b99; }
+    .rec-phishing-high      { border-left-color: #ef4444; background: #450a0a99; }
 
     .recommendation-card h4 { font-size: 0.82rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
     .recommendation-card p  { font-size: 0.92rem; line-height: 1.65; }
     .rec-likely-legitimate  p { color: #86efac; }
-    .rec-review-manually    p { color: #d4d4d4; }
-    .rec-suspicious         p { color: #fcd34d; }
-    .rec-phishing-probable  p { color: #fca5a5; }
+    .rec-phishing-low       p { color: #fcd34d; }
+    .rec-phishing-medium    p { color: #fdba74; }
+    .rec-phishing-high      p { color: #fca5a5; }
 
     /* ── network error ── */
     .error-banner {
@@ -370,6 +391,7 @@ PANEL_HTML = """
     .badge { padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
     .badge-phishing   { background: #7f1d1d; color: #fca5a5; }
     .badge-suspicious { background: #7c2d12; color: #fdba74; }
+    .badge-low        { background: #78350f; color: #fcd34d; }
     .badge-safe       { background: #14532d; color: #86efac; }
 
     @media (max-width: 600px) {
@@ -431,7 +453,7 @@ PANEL_HTML = """
       <div class="layer-card layer-neutral" id="layer1Card">
         <div class="layer-header">
           <span class="layer-icon" id="layer1Icon">—</span>
-          <span class="layer-title">Capa 1 · Whitelist</span>
+          <span class="layer-title">Capa 1 · Whitelist (decisiva)</span>
         </div>
         <div class="layer-body" id="layer1Body"></div>
       </div>
@@ -596,11 +618,11 @@ PANEL_HTML = """
     section.style.animation = '';
   }
 
-  /* ─── capa 1: whitelist ─── */
+  /* ─── capa 1: whitelist (DECISIVA) ─── */
   function renderLayer1(l1) {
     var passed = l1.passed;
-    document.getElementById('layer1Icon').textContent = passed ? '✅' : '—';
-    document.getElementById('layer1Card').className   = 'layer-card ' + (passed ? 'layer-safe' : 'layer-neutral');
+    document.getElementById('layer1Icon').textContent = passed ? '✅' : '🚫';
+    document.getElementById('layer1Card').className   = 'layer-card ' + (passed ? 'layer-safe' : 'layer-danger');
 
     var html = '';
     if (passed) {
@@ -612,12 +634,14 @@ PANEL_HTML = """
         html = '<div class="layer-row"><span class="tag tag-safe">En lista blanca</span> Contacto aprobado</div>';
       }
     } else {
-      html = '<div class="layer-row"><span class="tag tag-neutral">No registrado</span> No está en la lista de contactos aprobados</div>';
+      html = '<div class="layer-row"><span class="tag tag-danger">No autorizado</span> '
+           + 'No está en la lista de contactos aprobados. '
+           + 'Esta capa es <b>decisiva</b>: se marca como phishing.</div>';
     }
     document.getElementById('layer1Body').innerHTML = html;
   }
 
-  /* ─── capa 2: similitud ─── */
+  /* ─── capa 2: similitud (informativa, gradúa severidad) ─── */
   function renderLayer2(l2) {
     var suspicious = l2.suspicious || false;
     var sim        = l2.similarity_score || 0;
@@ -657,10 +681,12 @@ PANEL_HTML = """
       html += '<div class="layer-row"><span class="ok-badge">✓ Sin caracteres confusables</span></div>';
     }
 
+    html += '<div class="layer-row muted" style="margin-top:8px">Esta capa gradúa la severidad, no decide el veredicto.</div>';
+
     document.getElementById('layer2Body').innerHTML = html;
   }
 
-  /* ─── capa 3: ortografía ─── */
+  /* ─── capa 3: ortografía (informativa, gradúa severidad) ─── */
   function renderLayer3(l3, sa) {
     if (!l3.analyzed) {
       document.getElementById('layer3Icon').textContent = '—';
@@ -700,6 +726,8 @@ PANEL_HTML = """
       html += '<div class="spell-interp ' + interpCls + '">' + esc(sa.spelling_interpretation) + '</div>';
     }
 
+    html += '<div class="layer-row muted" style="margin-top:8px">Esta capa gradúa la severidad, no decide el veredicto.</div>';
+
     document.getElementById('layer3Body').innerHTML = html;
   }
 
@@ -714,13 +742,26 @@ PANEL_HTML = """
     } catch(e) {}
   }
 
-  /* ─── logs ─── */
+  /* ─── logs ───
+     Con la logica determinista: is_phishing=false SOLO si paso la
+     whitelist. Si is_phishing=true, usamos risk_score para mostrar
+     la severidad (BAJA/MEDIA/ALTA), alineado con los umbrales de
+     phishing_detector.py (_severity_label: 0.85 ALTA, 0.60 MEDIA).
+  */
   async function loadLogs() {
     try {
       var rows = await fetch('/api/phishing-logs?limit=20').then(function(r) { return r.json(); });
       document.getElementById('logsBody').innerHTML = rows.map(function(r) {
-        var cls = r.is_phishing ? 'badge-phishing' : (r.risk_score >= 0.35 ? 'badge-suspicious' : 'badge-safe');
-        var lbl = r.is_phishing ? 'PHISHING'       : (r.risk_score >= 0.35 ? 'SOSPECHOSO'       : 'LEGÍTIMO');
+        var cls, lbl;
+        if (!r.is_phishing) {
+          cls = 'badge-safe'; lbl = 'LEGÍTIMO';
+        } else if (r.risk_score >= 0.85) {
+          cls = 'badge-phishing'; lbl = 'PHISHING · ALTA';
+        } else if (r.risk_score >= 0.60) {
+          cls = 'badge-suspicious'; lbl = 'PHISHING · MEDIA';
+        } else {
+          cls = 'badge-low'; lbl = 'PHISHING · BAJA';
+        }
         return '<tr>'
           + '<td><span class="badge ' + cls + '">' + lbl + '</span></td>'
           + '<td>' + esc(r.email_or_url || '') + '</td>'
