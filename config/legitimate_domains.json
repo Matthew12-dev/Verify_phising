@@ -1,0 +1,19 @@
+{
+  "company_name": "MiEmpresa",
+  "legitimate_domains": [
+    "empresa.com",
+    "mail.empresa.com",
+    "soporte.empresa.com",
+    "tienda.empresa.com",
+    "intranet.empresa.com"
+  ],
+  "legitimate_emails": [
+    "ceo@empresa.com",
+    "contacto@empresa.com",
+    "soporte@empresa.com",
+    "ventas@empresa.com",
+    "rrhh@empresa.com",
+    "noreply@empresa.com",
+    "facturacion@empresa.com"
+  ]
+}
